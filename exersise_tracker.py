@@ -1,12 +1,25 @@
-from flask import Flask, render_template_string, Response
+from flask import Flask, render_template_string, Response, request, send_file
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
+import pytz
 import cv2
 import mediapipe as mp
 import numpy as np
 import threading
+import io
+import matplotlib.pyplot as plt
 
 app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///exercise_logs.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
 
-# Global variables for exercise tracking
+class ExerciseLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    exercise_type = db.Column(db.String(50), nullable=False)
+    count = db.Column(db.Integer, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7)
 cap = None
@@ -19,16 +32,16 @@ stabilization_counter = 0
 exercises = {
     'bicep': {
         'points': [mp_pose.PoseLandmark.LEFT_SHOULDER,
-                  mp_pose.PoseLandmark.LEFT_ELBOW,
-                  mp_pose.PoseLandmark.LEFT_WRIST],
+                   mp_pose.PoseLandmark.LEFT_ELBOW,
+                   mp_pose.PoseLandmark.LEFT_WRIST],
         'angles': {'min': 60, 'max': 150},
         'name': 'Bicep Curls'
     },
     'situp': {
         'points': [mp_pose.PoseLandmark.LEFT_SHOULDER,
-                  mp_pose.PoseLandmark.LEFT_HIP,
-                  mp_pose.PoseLandmark.LEFT_KNEE],
-        'angles': {'min': 80, 'max': 160},
+                   mp_pose.PoseLandmark.LEFT_HIP,
+                   mp_pose.PoseLandmark.LEFT_KNEE],
+        'angles': {'min': 40, 'max': 120},
         'name': 'Sit-ups'
     }
 }
@@ -37,9 +50,25 @@ def calculate_angle(a, b, c):
     a = np.array(a)
     b = np.array(b)
     c = np.array(c)
-    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
-    angle = np.abs(radians * 180.0 / np.pi)
-    return angle if angle < 180 else 360 - angle
+
+    ba = a - b
+    bc = c - b
+
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+    angle = np.arccos(np.clip(cosine_angle, -1, 1))
+    return np.degrees(angle)
+
+def save_to_database():
+    global exercise_count, current_exercise
+    if exercise_count > 0:
+        with app.app_context():
+            new_log = ExerciseLog(
+                exercise_type=exercises[current_exercise]['name'],
+                count=exercise_count
+            )
+            db.session.add(new_log)
+            db.session.commit()
+            print(f"Saved {exercise_count} {exercises[current_exercise]['name']} to database")
 
 def generate_frames():
     global tracking_active, current_exercise, exercise_count, state, stabilization_counter
@@ -56,14 +85,13 @@ def generate_frames():
             if results.pose_landmarks:
                 landmarks = results.pose_landmarks.landmark
                 exercise = exercises[current_exercise]
-                
+
                 try:
                     a = [landmarks[exercise['points'][0]].x, landmarks[exercise['points'][0]].y]
                     b = [landmarks[exercise['points'][1]].x, landmarks[exercise['points'][1]].y]
                     c = [landmarks[exercise['points'][2]].x, landmarks[exercise['points'][2]].y]
-                    
                     angle = calculate_angle(a, b, c)
-                    
+
                     if angle < exercise['angles']['min']:
                         if not state and stabilization_counter >= 5:
                             state = True
@@ -76,13 +104,12 @@ def generate_frames():
                             stabilization_counter = 0
                         stabilization_counter += 1
 
-                    # Draw overlay
-                    cv2.putText(frame, f"Count: {exercise_count}", (10, 30), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    cv2.putText(frame, f"Angle: {int(angle)}", (10, 70), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    cv2.putText(frame, exercise['name'], (10, 110), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(frame, f"Count: {exercise_count}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(frame, f"Angle: {int(angle)}", (10, 70),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(frame, exercise['name'], (10, 110),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
                 except Exception as e:
                     print(f"Error: {str(e)}")
@@ -94,6 +121,13 @@ def generate_frames():
 
 @app.route('/')
 def index():
+    logs = ExerciseLog.query.order_by(ExerciseLog.timestamp.desc()).limit(10).all()
+    
+    # Convert timestamps to local timezone
+    local_tz = pytz.timezone("Asia/Kolkata")  # Replace with your timezone
+    for log in logs:
+        log.local_time = log.timestamp.replace(tzinfo=pytz.utc).astimezone(local_tz)
+
     return render_template_string('''
     <!DOCTYPE html>
     <html>
@@ -101,74 +135,71 @@ def index():
         <title>Exercise Tracker</title>
         <style>
             body { font-family: Arial, sans-serif; text-align: center; }
-            .container { margin: 20px; }
-            button { 
-                padding: 15px 30px; 
-                margin: 10px; 
-                font-size: 16px; 
-                cursor: pointer; 
-                background: #4CAF50; 
-                color: white; 
-                border: none; 
-                border-radius: 5px; 
-            }
-            button:hover { background: #45a049; }
-            #videoFeed { 
-                margin: 20px; 
-                border: 2px solid #4CAF50;
-                border-radius: 5px;
-            }
+            button { padding: 10px 20px; margin: 10px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; }
+            button:hover { background: #218838; }
+            #videoFeed { margin: 20px; border: 2px solid #28a745; border-radius: 5px; width: 640px; height: 480px; }
+            table { margin: auto; width: 80%; border-collapse: collapse; }
+            th, td { border: 1px solid #ddd; padding: 10px; }
+            th { background-color: #28a745; color: white; }
+            tr:nth-child(even) { background-color: #f2f2f2; }
         </style>
     </head>
     <body>
-        <div class="container">
-            <h1>AI Exercise Tracker</h1>
-            <img id="videoFeed" src="{{ url_for('video_feed') }}">
-            <div>
-                <button onclick="toggleTracking()" id="startBtn">Start Tracking</button>
-                <button onclick="switchExercise()">Switch Exercise</button>
-                <button onclick="resetCounter()">Reset Counter</button>
-            </div>
+        <h1>AI Exercise Tracker</h1>
+        <img id="videoFeed" src="{{ url_for('video_feed') }}">
+        <div>
+            <button onclick="toggleTracking()" id="startBtn">Start Tracking</button>
+            <button onclick="switchExercise()">Switch Exercise</button>
+            <button onclick="resetCounter()">Reset Counter</button>
+            <a href="/chart"><button>View Progress Chart</button></a>
         </div>
+        <h2>Exercise History</h2>
+        <table>
+            <tr>
+                <th>Exercise</th>
+                <th>Count</th>
+                <th>Local Time</th>
+            </tr>
+            {% for log in logs %}
+            <tr>
+                <td>{{ log.exercise_type }}</td>
+                <td>{{ log.count }}</td>
+                <td>{{ log.local_time.strftime('%Y-%m-%d %I:%M %p') }}</td>
+            </tr>
+            {% endfor %}
+        </table>
         <script>
             let isTracking = false;
-            
             function toggleTracking() {
                 isTracking = !isTracking;
-                const btn = document.getElementById('startBtn');
-                btn.textContent = isTracking ? 'Stop Tracking' : 'Start Tracking';
+                document.getElementById('startBtn').textContent = isTracking ? 'Stop Tracking' : 'Start Tracking';
                 fetch(`/toggle_tracking?active=${isTracking}`);
             }
-            
             function switchExercise() {
-                fetch('/switch_exercise');
+                fetch('/switch_exercise').then(() => location.reload());
             }
-            
             function resetCounter() {
                 fetch('/reset_counter');
             }
-            
-            // Auto-reconnect to video stream
-            const videoFeed = document.getElementById('videoFeed');
-            function reloadVideo() {
-                videoFeed.src = "{{ url_for('video_feed') }}?t=" + new Date().getTime();
-            }
-            setInterval(reloadVideo, 5000);
         </script>
     </body>
     </html>
-    ''')
+    ''', logs=logs)
 
 @app.route('/video_feed')
 def video_feed():
-    return Response(generate_frames(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/toggle_tracking')
 def toggle_tracking():
     global tracking_active, cap
-    tracking_active = not tracking_active
-    if tracking_active and not cap:
+    new_state = request.args.get('active') == 'true'
+
+    if tracking_active and not new_state:
+        save_to_database()
+
+    tracking_active = new_state
+    if tracking_active and cap is None:
         cap = cv2.VideoCapture(0)
     elif not tracking_active and cap:
         cap.release()
@@ -178,6 +209,7 @@ def toggle_tracking():
 @app.route('/switch_exercise')
 def switch_exercise():
     global current_exercise, exercise_count, state, stabilization_counter
+    save_to_database()
     current_exercise = 'situp' if current_exercise == 'bicep' else 'bicep'
     exercise_count = 0
     state = False
@@ -190,7 +222,34 @@ def reset_counter():
     exercise_count = 0
     return '', 204
 
+@app.route('/chart')
+def chart():
+    logs = ExerciseLog.query.order_by(ExerciseLog.timestamp).all()
+    types = {}
+    for log in logs:
+        if log.exercise_type not in types:
+            types[log.exercise_type] = {'timestamps': [], 'counts': []}
+        types[log.exercise_type]['timestamps'].append(log.timestamp)
+        types[log.exercise_type]['counts'].append(log.count)
+
+    fig, ax = plt.subplots()
+    for exercise_type, data in types.items():
+        ax.plot(data['timestamps'], data['counts'], label=exercise_type)
+
+    ax.set_title("Exercise Progress Over Time")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Repetitions")
+    ax.legend()
+    fig.autofmt_xdate()
+
+    img = io.BytesIO()
+    plt.savefig(img, format='png')
+    img.seek(0)
+    return send_file(img, mimetype='image/png')
+
 def run_app():
+    with app.app_context():
+        db.create_all()
     app.run(host='0.0.0.0', port=5000, threaded=True)
 
 if __name__ == '__main__':
