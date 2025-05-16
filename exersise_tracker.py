@@ -5,9 +5,10 @@ import pytz
 import cv2
 import mediapipe as mp
 import numpy as np
-import threading
 import io
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from collections import defaultdict
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///exercise_logs.db'
@@ -46,14 +47,14 @@ exercises = {
     }
 }
 
+calories_per_rep = {
+    'Bicep Curls': 0.3,
+    'Sit-ups': 0.5
+}
+
 def calculate_angle(a, b, c):
-    a = np.array(a)
-    b = np.array(b)
-    c = np.array(c)
-
-    ba = a - b
-    bc = c - b
-
+    a, b, c = np.array(a), np.array(b), np.array(c)
+    ba, bc = a - b, c - b
     cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
     angle = np.arccos(np.clip(cosine_angle, -1, 1))
     return np.degrees(angle)
@@ -122,9 +123,7 @@ def generate_frames():
 @app.route('/')
 def index():
     logs = ExerciseLog.query.order_by(ExerciseLog.timestamp.desc()).limit(10).all()
-    
-    # Convert timestamps to local timezone
-    local_tz = pytz.timezone("Asia/Kolkata")  # Replace with your timezone
+    local_tz = pytz.timezone("Asia/Kolkata")
     for log in logs:
         log.local_time = log.timestamp.replace(tzinfo=pytz.utc).astimezone(local_tz)
 
@@ -151,7 +150,7 @@ def index():
             <button onclick="toggleTracking()" id="startBtn">Start Tracking</button>
             <button onclick="switchExercise()">Switch Exercise</button>
             <button onclick="resetCounter()">Reset Counter</button>
-            <a href="/chart"><button>View Progress Chart</button></a>
+            <a href="/calories_chart"><button>View Calories Chart</button></a>
         </div>
         <h2>Exercise History</h2>
         <table>
@@ -194,10 +193,8 @@ def video_feed():
 def toggle_tracking():
     global tracking_active, cap
     new_state = request.args.get('active') == 'true'
-
     if tracking_active and not new_state:
         save_to_database()
-
     tracking_active = new_state
     if tracking_active and cap is None:
         cap = cv2.VideoCapture(0)
@@ -222,28 +219,62 @@ def reset_counter():
     exercise_count = 0
     return '', 204
 
-@app.route('/chart')
-def chart():
+@app.route('/calories_chart')
+def calories_chart():
     logs = ExerciseLog.query.order_by(ExerciseLog.timestamp).all()
-    types = {}
+
+    # Prepare calories per day data
+    calories_by_day = defaultdict(float)
+    # Prepare exercise counts per day per type
+    counts_by_day_type = defaultdict(lambda: defaultdict(int))
+
     for log in logs:
-        if log.exercise_type not in types:
-            types[log.exercise_type] = {'timestamps': [], 'counts': []}
-        types[log.exercise_type]['timestamps'].append(log.timestamp)
-        types[log.exercise_type]['counts'].append(log.count)
+        day = log.timestamp.date()
+        cal = log.count * calories_per_rep.get(log.exercise_type, 0.4)
+        calories_by_day[day] += cal
+        counts_by_day_type[day][log.exercise_type] += log.count
 
-    fig, ax = plt.subplots()
-    for exercise_type, data in types.items():
-        ax.plot(data['timestamps'], data['counts'], label=exercise_type)
+    sorted_days = sorted(calories_by_day.keys())
 
-    ax.set_title("Exercise Progress Over Time")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Repetitions")
-    ax.legend()
-    fig.autofmt_xdate()
+    # Calories for line graph
+    calories = [calories_by_day[day] for day in sorted_days]
+
+    # Prepare stacked bar data
+    exercise_types = sorted({ex for counts in counts_by_day_type.values() for ex in counts.keys()})
+    counts_per_exercise = {ex: [counts_by_day_type[day].get(ex, 0) for day in sorted_days] for ex in exercise_types}
+
+    # Convert dates for matplotlib
+    mpl_dates = mdates.date2num(sorted_days)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+    # Line plot - Calories burned per day
+    ax1.plot_date(mpl_dates, calories, linestyle='solid', marker='o', color='blue')
+    ax1.set_title("Total Calories Burned Per Day")
+    ax1.set_ylabel("Calories")
+    ax1.grid(True)
+
+    # Stacked bar chart - Exercise counts per day
+    bottom = np.zeros(len(sorted_days))
+    colors = plt.cm.tab20.colors  # color palette
+    for idx, ex in enumerate(exercise_types):
+        ax2.bar(mpl_dates, counts_per_exercise[ex], bottom=bottom, label=ex, color=colors[idx % len(colors)], width=0.8)
+        bottom += np.array(counts_per_exercise[ex])
+
+    ax2.set_title("Exercise Counts Per Day by Type")
+    ax2.set_ylabel("Count")
+    ax2.legend()
+    ax2.grid(True)
+
+    # Format x-axis dates nicely
+    ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    fig.autofmt_xdate(rotation=45)
+    plt.tight_layout()
 
     img = io.BytesIO()
     plt.savefig(img, format='png')
+    plt.close(fig)
     img.seek(0)
     return send_file(img, mimetype='image/png')
 
