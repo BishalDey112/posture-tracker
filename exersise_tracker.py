@@ -15,12 +15,22 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///exercise_logs.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
+# Models
 class ExerciseLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     exercise_type = db.Column(db.String(50), nullable=False)
     count = db.Column(db.Integer, nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
 
+class UserBMI(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    height_cm = db.Column(db.Float, nullable=False)
+    weight_kg = db.Column(db.Float, nullable=False)
+    bmi_value = db.Column(db.Float, nullable=False)
+    status = db.Column(db.String(20), nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+# MediaPipe setup
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7)
 cap = None
@@ -69,7 +79,6 @@ def save_to_database():
             )
             db.session.add(new_log)
             db.session.commit()
-            print(f"Saved {exercise_count} {exercises[current_exercise]['name']} to database")
 
 def generate_frames():
     global tracking_active, current_exercise, exercise_count, state, stabilization_counter
@@ -78,7 +87,6 @@ def generate_frames():
             success, frame = cap.read()
             if not success:
                 continue
-
             frame = cv2.flip(frame, 1)
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
@@ -86,7 +94,6 @@ def generate_frames():
             if results.pose_landmarks:
                 landmarks = results.pose_landmarks.landmark
                 exercise = exercises[current_exercise]
-
                 try:
                     a = [landmarks[exercise['points'][0]].x, landmarks[exercise['points'][0]].y]
                     b = [landmarks[exercise['points'][1]].x, landmarks[exercise['points'][1]].y]
@@ -111,79 +118,74 @@ def generate_frames():
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                     cv2.putText(frame, exercise['name'], (10, 110),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
                 except Exception as e:
                     print(f"Error: {str(e)}")
 
             ret, buffer = cv2.imencode('.jpg', frame)
             frame = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
 @app.route('/')
 def index():
     logs = ExerciseLog.query.order_by(ExerciseLog.timestamp.desc()).limit(10).all()
+    bmi_data = UserBMI.query.order_by(UserBMI.timestamp.desc()).first()
     local_tz = pytz.timezone("Asia/Kolkata")
     for log in logs:
         log.local_time = log.timestamp.replace(tzinfo=pytz.utc).astimezone(local_tz)
 
-    return render_template_string('''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Exercise Tracker</title>
-        <style>
-            body { font-family: Arial, sans-serif; text-align: center; }
-            button { padding: 10px 20px; margin: 10px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; }
-            button:hover { background: #218838; }
-            #videoFeed { margin: 20px; border: 2px solid #28a745; border-radius: 5px; width: 640px; height: 480px; }
-            table { margin: auto; width: 80%; border-collapse: collapse; }
-            th, td { border: 1px solid #ddd; padding: 10px; }
-            th { background-color: #28a745; color: white; }
-            tr:nth-child(even) { background-color: #f2f2f2; }
-        </style>
-    </head>
-    <body>
-        <h1>AI Exercise Tracker</h1>
-        <img id="videoFeed" src="{{ url_for('video_feed') }}">
-        <div>
-            <button onclick="toggleTracking()" id="startBtn">Start Tracking</button>
-            <button onclick="switchExercise()">Switch Exercise</button>
-            <button onclick="resetCounter()">Reset Counter</button>
-            <a href="/calories_chart"><button>View Calories Chart</button></a>
-        </div>
-        <h2>Exercise History</h2>
-        <table>
-            <tr>
-                <th>Exercise</th>
-                <th>Count</th>
-                <th>Local Time</th>
-            </tr>
-            {% for log in logs %}
-            <tr>
-                <td>{{ log.exercise_type }}</td>
-                <td>{{ log.count }}</td>
-                <td>{{ log.local_time.strftime('%Y-%m-%d %I:%M %p') }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-        <script>
-            let isTracking = false;
-            function toggleTracking() {
-                isTracking = !isTracking;
-                document.getElementById('startBtn').textContent = isTracking ? 'Stop Tracking' : 'Start Tracking';
-                fetch(`/toggle_tracking?active=${isTracking}`);
-            }
-            function switchExercise() {
-                fetch('/switch_exercise').then(() => location.reload());
-            }
-            function resetCounter() {
-                fetch('/reset_counter');
-            }
-        </script>
-    </body>
-    </html>
-    ''', logs=logs)
+    return render_template_string('''<!DOCTYPE html>
+    <html><head><title>AI Exercise Tracker</title>
+    <style>body{font-family:sans-serif;background:#f7f9fa}.container{max-width:1100px;margin:auto;padding:20px}
+    button{margin:10px;padding:10px 20px;background:#28a745;color:white;border:none;border-radius:5px;cursor:pointer}
+    table{width:100%;margin-top:20px;border-collapse:collapse}th,td{padding:10px;border:1px solid #ddd}
+    th{background:#28a745;color:white}.bmi-box{background:#e9f8ee;padding:15px;border-radius:10px;float:right;width:250px}
+    </style></head><body><div class="container">
+    <h1>AI Exercise Tracker</h1>
+    {% if bmi_data %}<div class="bmi-box"><h3>Your BMI</h3>
+    <p><strong>Value:</strong> {{ bmi_data.bmi_value | round(2) }}</p>
+    <p><strong>Status:</strong> {{ bmi_data.status }}</p>
+    <p><strong>Height:</strong> {{ bmi_data.height_cm }} cm</p>
+    <p><strong>Weight:</strong> {{ bmi_data.weight_kg }} kg</p></div>{% endif %}
+    <img src="{{ url_for('video_feed') }}" width="640" height="480"><br>
+    <button onclick="toggleTracking()" id="startBtn">Start Tracking</button>
+    <button onclick="switchExercise()">Switch Exercise</button>
+    <button onclick="resetCounter()">Reset Counter</button>
+    <a href="/calories_chart"><button>Calories Chart</button></a>
+    <a href="/exercise_line_chart"><button>Exercise Line Chart</button></a>
+
+    <h2>Track Your BMI</h2>
+    <form action="/submit_bmi" method="POST">
+    Height (cm): <input type="number" step="0.1" name="height" required>
+    Weight (kg): <input type="number" step="0.1" name="weight" required>
+    <input type="submit" value="Calculate & Save BMI"></form>
+
+    <h2>Exercise History</h2><table>
+    <tr><th>Exercise</th><th>Count</th><th>Local Time</th></tr>
+    {% for log in logs %}
+    <tr><td>{{ log.exercise_type }}</td><td>{{ log.count }}</td><td>{{ log.local_time.strftime('%Y-%m-%d %I:%M %p') }}</td></tr>
+    {% endfor %}</table></div>
+    <script>
+    let isTracking = false;
+    function toggleTracking() {
+        isTracking = !isTracking;
+        document.getElementById('startBtn').textContent = isTracking ? 'Stop Tracking' : 'Start Tracking';
+        fetch(`/toggle_tracking?active=${isTracking}`);
+    }
+    function switchExercise() { fetch('/switch_exercise').then(() => location.reload()); }
+    function resetCounter() { fetch('/reset_counter'); }
+    </script></body></html>''', logs=logs, bmi_data=bmi_data)
+
+@app.route('/submit_bmi', methods=['POST'])
+def submit_bmi():
+    height = float(request.form['height'])
+    weight = float(request.form['weight'])
+    bmi = weight / ((height / 100) ** 2)
+    status = ('Underweight' if bmi < 18.5 else
+              'Normal' if bmi < 25 else
+              'Overweight' if bmi < 30 else 'Obese')
+    db.session.add(UserBMI(height_cm=height, weight_kg=weight, bmi_value=bmi, status=status))
+    db.session.commit()
+    return '', 204
 
 @app.route('/video_feed')
 def video_feed():
@@ -222,61 +224,54 @@ def reset_counter():
 @app.route('/calories_chart')
 def calories_chart():
     logs = ExerciseLog.query.order_by(ExerciseLog.timestamp).all()
-
-    # Prepare calories per day data
     calories_by_day = defaultdict(float)
-    # Prepare exercise counts per day per type
-    counts_by_day_type = defaultdict(lambda: defaultdict(int))
-
     for log in logs:
         day = log.timestamp.date()
         cal = log.count * calories_per_rep.get(log.exercise_type, 0.4)
         calories_by_day[day] += cal
-        counts_by_day_type[day][log.exercise_type] += log.count
-
-    sorted_days = sorted(calories_by_day.keys())
-
-    # Calories for line graph
+    sorted_days = sorted(calories_by_day)
     calories = [calories_by_day[day] for day in sorted_days]
-
-    # Prepare stacked bar data
-    exercise_types = sorted({ex for counts in counts_by_day_type.values() for ex in counts.keys()})
-    counts_per_exercise = {ex: [counts_by_day_type[day].get(ex, 0) for day in sorted_days] for ex in exercise_types}
-
-    # Convert dates for matplotlib
     mpl_dates = mdates.date2num(sorted_days)
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-
-    # Line plot - Calories burned per day
-    ax1.plot_date(mpl_dates, calories, linestyle='solid', marker='o', color='blue')
-    ax1.set_title("Total Calories Burned Per Day")
-    ax1.set_ylabel("Calories")
-    ax1.grid(True)
-
-    # Stacked bar chart - Exercise counts per day
-    bottom = np.zeros(len(sorted_days))
-    colors = plt.cm.tab20.colors  # color palette
-    for idx, ex in enumerate(exercise_types):
-        ax2.bar(mpl_dates, counts_per_exercise[ex], bottom=bottom, label=ex, color=colors[idx % len(colors)], width=0.8)
-        bottom += np.array(counts_per_exercise[ex])
-
-    ax2.set_title("Exercise Counts Per Day by Type")
-    ax2.set_ylabel("Count")
-    ax2.legend()
-    ax2.grid(True)
-
-    # Format x-axis dates nicely
-    ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    fig.autofmt_xdate(rotation=45)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot_date(mpl_dates, calories, linestyle='solid', marker='o', color='blue')
+    ax.set_title("Total Calories Burned Per Day")
+    ax.set_ylabel("Calories")
+    ax.grid(True)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    fig.autofmt_xdate()
     plt.tight_layout()
-
-    img = io.BytesIO()
-    plt.savefig(img, format='png')
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
     plt.close(fig)
-    img.seek(0)
-    return send_file(img, mimetype='image/png')
+    buf.seek(0)
+    return send_file(buf, mimetype='image/png')
+
+@app.route('/exercise_line_chart')
+def exercise_line_chart():
+    logs = ExerciseLog.query.order_by(ExerciseLog.timestamp).all()
+    counts_by_day_type = defaultdict(lambda: defaultdict(int))
+    for log in logs:
+        day = log.timestamp.date()
+        counts_by_day_type[day][log.exercise_type] += log.count
+    sorted_days = sorted(counts_by_day_type.keys())
+    exercise_types = sorted({ex for day in counts_by_day_type.values() for ex in day})
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for ex in exercise_types:
+        daily_counts = [counts_by_day_type[day].get(ex, 0) for day in sorted_days]
+        ax.plot(sorted_days, daily_counts, label=ex, marker='o')
+    ax.set_title("Exercise Counts Per Day (Line Chart)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Count")
+    ax.grid(True)
+    ax.legend()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    fig.autofmt_xdate()
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format='png')
+    plt.close(fig)
+    buf.seek(0)
+    return send_file(buf, mimetype='image/png')
 
 def run_app():
     with app.app_context():
