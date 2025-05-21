@@ -15,20 +15,14 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///exercise_logs.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# Models
+# Use IST timezone
+IST = pytz.timezone("Asia/Kolkata")
+
 class ExerciseLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     exercise_type = db.Column(db.String(50), nullable=False)
     count = db.Column(db.Integer, nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-
-class UserBMI(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    height_cm = db.Column(db.Float, nullable=False)
-    weight_kg = db.Column(db.Float, nullable=False)
-    bmi_value = db.Column(db.Float, nullable=False)
-    status = db.Column(db.String(20), nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    timestamp = db.Column(db.DateTime, default=lambda: datetime.now(IST).replace(tzinfo=None))
 
 # MediaPipe setup
 mp_pose = mp.solutions.pose
@@ -128,24 +122,14 @@ def generate_frames():
 @app.route('/')
 def index():
     logs = ExerciseLog.query.order_by(ExerciseLog.timestamp.desc()).limit(10).all()
-    bmi_data = UserBMI.query.order_by(UserBMI.timestamp.desc()).first()
-    local_tz = pytz.timezone("Asia/Kolkata")
-    for log in logs:
-        log.local_time = log.timestamp.replace(tzinfo=pytz.utc).astimezone(local_tz)
-
     return render_template_string('''<!DOCTYPE html>
     <html><head><title>AI Exercise Tracker</title>
     <style>body{font-family:sans-serif;background:#f7f9fa}.container{max-width:1100px;margin:auto;padding:20px}
     button{margin:10px;padding:10px 20px;background:#28a745;color:white;border:none;border-radius:5px;cursor:pointer}
     table{width:100%;margin-top:20px;border-collapse:collapse}th,td{padding:10px;border:1px solid #ddd}
-    th{background:#28a745;color:white}.bmi-box{background:#e9f8ee;padding:15px;border-radius:10px;float:right;width:250px}
+    th{background:#28a745;color:white}
     </style></head><body><div class="container">
     <h1>AI Exercise Tracker</h1>
-    {% if bmi_data %}<div class="bmi-box"><h3>Your BMI</h3>
-    <p><strong>Value:</strong> {{ bmi_data.bmi_value | round(2) }}</p>
-    <p><strong>Status:</strong> {{ bmi_data.status }}</p>
-    <p><strong>Height:</strong> {{ bmi_data.height_cm }} cm</p>
-    <p><strong>Weight:</strong> {{ bmi_data.weight_kg }} kg</p></div>{% endif %}
     <img src="{{ url_for('video_feed') }}" width="640" height="480"><br>
     <button onclick="toggleTracking()" id="startBtn">Start Tracking</button>
     <button onclick="switchExercise()">Switch Exercise</button>
@@ -153,16 +137,17 @@ def index():
     <a href="/calories_chart"><button>Calories Chart</button></a>
     <a href="/exercise_line_chart"><button>Exercise Line Chart</button></a>
 
-    <h2>Track Your BMI</h2>
-    <form action="/submit_bmi" method="POST">
-    Height (cm): <input type="number" step="0.1" name="height" required>
-    Weight (kg): <input type="number" step="0.1" name="weight" required>
-    <input type="submit" value="Calculate & Save BMI"></form>
+    <h2>Calculate Your BMI (Not Saved)</h2>
+    <form onsubmit="calculateBMI(event)">
+    Height (cm): <input type="number" step="0.1" id="height" required>
+    Weight (kg): <input type="number" step="0.1" id="weight" required>
+    <input type="submit" value="Calculate BMI"></form>
+    <div id="bmiResult"></div>
 
     <h2>Exercise History</h2><table>
-    <tr><th>Exercise</th><th>Count</th><th>Local Time</th></tr>
+    <tr><th>Exercise</th><th>Count</th><th>IST Time</th></tr>
     {% for log in logs %}
-    <tr><td>{{ log.exercise_type }}</td><td>{{ log.count }}</td><td>{{ log.local_time.strftime('%Y-%m-%d %I:%M %p') }}</td></tr>
+    <tr><td>{{ log.exercise_type }}</td><td>{{ log.count }}</td><td>{{ log.timestamp.strftime('%Y-%m-%d %I:%M %p') }}</td></tr>
     {% endfor %}</table></div>
     <script>
     let isTracking = false;
@@ -171,21 +156,18 @@ def index():
         document.getElementById('startBtn').textContent = isTracking ? 'Stop Tracking' : 'Start Tracking';
         fetch(`/toggle_tracking?active=${isTracking}`);
     }
-    function switchExercise() { fetch('/switch_exercise').then(() => location.reload()); }
+    function switchExercise() { fetch('/switch_exercise'); }
     function resetCounter() { fetch('/reset_counter'); }
-    </script></body></html>''', logs=logs, bmi_data=bmi_data)
-
-@app.route('/submit_bmi', methods=['POST'])
-def submit_bmi():
-    height = float(request.form['height'])
-    weight = float(request.form['weight'])
-    bmi = weight / ((height / 100) ** 2)
-    status = ('Underweight' if bmi < 18.5 else
-              'Normal' if bmi < 25 else
-              'Overweight' if bmi < 30 else 'Obese')
-    db.session.add(UserBMI(height_cm=height, weight_kg=weight, bmi_value=bmi, status=status))
-    db.session.commit()
-    return '', 204
+    function calculateBMI(e) {
+        e.preventDefault();
+        const h = parseFloat(document.getElementById("height").value);
+        const w = parseFloat(document.getElementById("weight").value);
+        const bmi = w / ((h / 100) ** 2);
+        let status = bmi < 18.5 ? "Underweight" : bmi < 25 ? "Normal" : bmi < 30 ? "Overweight" : "Obese";
+        document.getElementById("bmiResult").innerHTML = 
+            `<p><strong>BMI:</strong> ${bmi.toFixed(2)} (${status})</p>`;
+    }
+    </script></body></html>''', logs=logs)
 
 @app.route('/video_feed')
 def video_feed():
